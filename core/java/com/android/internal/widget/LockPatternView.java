@@ -199,7 +199,7 @@ public class LockPatternView extends View {
             for (int i = 0; i < size; i++) {
                 for (int j = 0; j < size; j++) {
                     sCells[i][j] = new Cell(i, j, size);
-                }
+
             }
         }
 
@@ -207,6 +207,7 @@ public class LockPatternView extends View {
             if (row < 0 || row > size - 1) {
                 throw new IllegalArgumentException("row must be in range 0-" + (size - 1));
             }
+
             if (column < 0 || column > size - 1) {
                 throw new IllegalArgumentException("column must be in range 0-" + (size - 1));
             }
@@ -1172,10 +1173,12 @@ public class LockPatternView extends View {
                 for (int j = 0; j < mPatternSize; j++) {
                     CellState cellState = mCellStates[i][j];
                     float centerX = getCenterXForColumn(j);
-                    float translationY = cellState.translationY;
+                    float translationY = cellState.translation
+                    if (isHardwareAccelerated() && cellState.hwAnimating) {
+                        DisplayListCanvas displayListCanvas = (DisplayListCanvas) canvas;
+                        displayListCanvas.drawCircle(cellState.hwCenterX, cellState.hwCenterY,
+                                cellState.hwRadius, cellState.hwPaint);
 
-                    if (mUseLockPatternDrawable) {
-                        drawCellDrawable(canvas, i, j, cellState.radius, drawLookup[i][j]);
                     } else {
                         if (isHardwareAccelerated() && cellState.hwAnimating) {
                             DisplayListCanvas displayListCanvas = (DisplayListCanvas) canvas;
