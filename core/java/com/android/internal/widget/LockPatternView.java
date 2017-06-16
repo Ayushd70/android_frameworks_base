@@ -1174,7 +1174,7 @@ public class LockPatternView extends View {
                 for (int j = 0; j < mPatternSize; j++) {
                     CellState cellState = mCellStates[i][j];
                     float centerX = getCenterXForColumn(j);
-                    float translationY = cellState.translation
+                    float translationY = cellState.translationY;
                     if (isHardwareAccelerated() && cellState.hwAnimating) {
                         DisplayListCanvas displayListCanvas = (DisplayListCanvas) canvas;
                         displayListCanvas.drawCircle(cellState.hwCenterX, cellState.hwCenterY,
