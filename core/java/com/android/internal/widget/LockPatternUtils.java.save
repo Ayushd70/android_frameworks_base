@@ -1,0 +1,322 @@
+/*
+ * Copyright (C) 2007 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.android.internal.widget;
+
+import android.annotation.IntDef;
+import android.annotation.Nullable;
+import android.app.admin.DevicePolicyManager;
+import android.app.trust.IStrongAuthTracker;
+import android.app.trust.TrustManager;
+import android.content.ComponentName;
+import android.content.ContentResolver;
+import android.content.Context;
+import android.content.pm.UserInfo;
+import android.os.AsyncTask;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Message;
+import android.os.RemoteException;
+import android.os.ServiceManager;
+import android.os.SystemClock;
+import android.os.UserHandle;
+import android.os.UserManager;
+import android.os.storage.IMountService;
+import android.os.storage.StorageManager;
+import android.provider.Settings;
+import android.text.TextUtils;
+import android.util.Log;
+import android.util.SparseIntArray;
+
+import com.google.android.collect.Lists;
+
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+
+import libcore.util.HexEncoding;
+
+/**
+ * Utilities for the lock pattern and its settings.
+ */
+public class LockPatternUtils {
+
+    private static final String TAG = "LockPatternUtils";
+    private static final boolean DEBUG = false;
+
+    /**
+     * The key to identify when the lock pattern enabled flag is being acccessed for legacy reasons.
+     */
+    public static final String LEGACY_LOCK_PATTERN_ENABLED = "legacy_lock_pattern_enabled";
+
+    /**
+     * The number of incorrect attempts before which we fall back on an alternative
+     * method of verifying the user, and resetting their lock pattern.
+     */
+    public static final int FAILED_ATTEMPTS_BEFORE_RESET = 20;
+
+    /**
+     * The interval of the countdown for showing progress of the lockout.
+     */
+    public static final long FAILED_ATTEMPT_COUNTDOWN_INTERVAL_MS = 1000L;
+
+
+    /**
+     * This dictates when we start telling the user that continued failed attempts will wipe
+     * their device.
+     */
+    public static final int FAILED_ATTEMPTS_BEFORE_WIPE_GRACE = 5;
+
+    /**
+     * The minimum number of dots in a valid pattern.
+     */
+    public static final int MIN_LOCK_PATTERN_SIZE = 4;
+
+    /**
+     * The minimum size of a valid password.
+     */
+    public static final int MIN_LOCK_PASSWORD_SIZE = 4;
+
+    /*
+ m    * The default size of the pattern lockscreen. Ex: 3x3
+     */
+    public static final byte PATTERN_SIZE_DEFAULT = 3;
+
+    /**
+     * The minimum number of dots the user must include in a wrong pattern
+     * attempt for it to be counted against the counts that affect
+     * {@link #FAILED_ATTEMPTS_BEFORE_TIMEOUT} and {@link #FAILED_ATTEMPTS_BEFORE_RESET}
+     */
+    public static final int MIN_PATTERN_REGISTER_FAIL = MIN_LOCK_PATTERN_SIZE;
+
+    @Deprecated
+    public final static String LOCKOUT_PERMANENT_KEY = "lockscreen.lockedoutpermanently";
+    public final static String LOCKOUT_ATTEMPT_DEADLINE = "lockscreen.lockoutattemptdeadline";
+    public final static String LOCKOUT_ATTEMPT_TIMEOUT_MS = "lockscreen.lockoutattempttimeoutmss";
+    public final static String PATTERN_EVER_CHOSEN_KEY = "lockscreen.patterneverchosen";
+    public final static String PASSWORD_TYPE_KEY = "lockscreen.password_type";
+    @Deprecated
+    public final static String PASSWORD_TYPE_ALTERNATE_KEY = "lockscreen.password_type_alternate";
+    public final static String LOCK_PASSWORD_SALT_KEY = "lockscreen.password_salt";
+    public final static String DISABLE_LOCKSCREEN_KEY = "lockscreen.disabled";
+    public final static String LOCKSCREEN_OPTIONS = "lockscreen.options";
+    @Deprecated
+    public final static String LOCKSCREEN_BIOMETRIC_WEAK_FALLBACK
+            = "lockscreen.biometric_weak_fallback";
+    @Deprecated
+    public final static String BIOMETRIC_WEAK_EVER_CHOSEN_KEY
+            = "lockscreen.biometricweakeverchosen";
+    public final static String LOCKSCREEN_POWER_BUTTON_INSTANTLY_LOCKS
+            = "lockscreen.power_button_instantly_locks";
+    @Deprecated
+    public final static String LOCKSCREEN_WIDGETS_ENABLED = "lockscreen.widgets_enabled";
+
+    public final static String PASSWORD_HISTORY_KEY = "lockscreen.passwordhistory";
+
+    private static final String LOCK_SCREEN_OWNER_INFO = Settings.Secure.LOCK_SCREEN_OWNER_INFO;
+    private static final String LOCK_SCREEN_OWNER_INFO_ENABLED =
+            Settings.Secure.LOCK_SCREEN_OWNER_INFO_ENABLED;
+
+    private static final String LOCK_SCREEN_DEVICE_OWNER_INFO = "lockscreen.device_owner_info";
+
+    private static final String ENABLED_TRUST_AGENTS = "lockscreen.enabledtrustagents";
+    private static final String IS_TRUST_USUALLY_MANAGED = "lockscreen.istrustusuallymanaged";
+
+    // Maximum allowed number of repeated or ordered characters in a sequence before we'll
+    // consider it a complex PIN/password.
+    public static final int MAX_ALLOWED_SEQUENCE = 3;
+
+    public static final String PROFILE_KEY_NAME_ENCRYPT = "profile_key_name_encrypt_";
+    public static final String PROFILE_KEY_NAME_DECRYPT = "profile_key_name_decrypt_";
+
+    private final Context mContext;
+    private final ContentResolver mContentResolver;
+    private DevicePolicyManager mDevicePolicyManager;
+    private ILockSettings mLockSettingsService;
+    private UserManager mUserManager;
+    private final Handler mHandler;
+
+    /**
+     * Use {@link TrustManager#isTrustUsuallyManaged(int)}.
+     *
+     * This returns the lazily-peristed value and should only be used by TrustManagerService.
+     */
+    public boolean isTrustUsuallyManaged(int userId) {
+        if (!(mLockSettingsService instanceof ILockSettings.Stub)) {
+            throw new IllegalStateException("May only be called by TrustManagerService. "
+                    + "Use TrustManager.isTrustUsuallyManaged()");
+        }
+        try {
+            return getLockSettings().getBoolean(IS_TRUST_USUALLY_MANAGED, false, userId);
+        } catch (RemoteException e) {
+            return false;
+        }
+    }
+
+    public void setTrustUsuallyManaged(boolean managed, int userId) {
+        try {
+            getLockSettings().setBoolean(IS_TRUST_USUALLY_MANAGED, managed, userId);
+        } catch (RemoteException e) {
+            // System dead.
+        }
+    }
+
+    public void userPresent(int userId) {
+        try {
+            getLockSettings().userPresent(userId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    public static final class RequestThrottledException extends Exception {
+        private int mTimeoutMs;
+        public RequestThrottledException(int timeoutMs) {
+            mTimeoutMs = timeoutMs;
+        }
+
+        /**
+         * @return The amount of time in ms before another request may
+         * be executed
+         */
+        public int getTimeoutMs() {
+            return mTimeoutMs;
+        }
+
+    }
+
+    public DevicePolicyManager getDevicePolicyManager() {
+        if (mDevicePolicyManager == null) {
+            mDevicePolicyManager =
+                (DevicePolicyManager)mContext.getSystemService(Context.DEVICE_POLICY_SERVICE);
+            if (mDevicePolicyManager == null) {
+                Log.e(TAG, "Can't get DevicePolicyManagerService: is it running?",
+                        new IllegalStateException("Stack trace:"));
+            }
+        }
+        return mDevicePolicyManager;
+    }
+
+  @Deprecated
+    public final static String PASSWORD_TYPE_ALTERNATE_KEY = "lockscreen.password_type_alternate";
+    public final static String LOCK_PASSWORD_SALT_KEY = "lockscreen.password_salt";
+    public final static String DISABLE_LOCKSCREEN_KEY = "lockscreen.disabled";
+    public final static String LOCKSCREEN_OPTIONS = "lockscreen.options";
+    @Deprecated
+    public final static String LOCKSCREEN_BIOMETRIC_WEAK_FALLBACK
+            = "lockscreen.biometric_weak_fallback";
+    @Deprecated
+    public final static String BIOMETRIC_WEAK_EVER_CHOSEN_KEY
+            = "lockscreen.biometricweakeverchosen";
+    public final static String LOCKSCREEN_POWER_BUTTON_INSTANTLY_LOCKS
+            = "lockscreen.power_button_instantly_locks";
+    @Deprecated
+    public final static String LOCKSCREEN_WIDGETS_ENABLED = "lockscreen.widgets_enabled";
+
+    public final static String PASSWORD_HISTORY_KEY = "lockscreen.passwordhistory";
+
+    private static final String LOCK_SCREEN_OWNER_INFO = Settings.Secure.LOCK_SCREEN_OWNER_INFO;
+    private static final String LOCK_SCREEN_OWNER_INFO_ENABLED =
+            Settings.Secure.LOCK_SCREEN_OWNER_INFO_ENABLED;
+
+    private static final String LOCK_SCREEN_DEVICE_OWNER_INFO = "lockscreen.device_owner_info";
+
+    private static final String ENABLED_TRUST_AGENTS = "lockscreen.enabledtrustagents";
+    private static final String IS_TRUST_USUALLY_MANAGED = "lockscreen.istrustusuallymanaged";
+
+    // Maximum allowed number of repeated or ordered characters in a sequence before we'll
+    // consider it a complex PIN/password.
+    public static final int MAX_ALLOWED_SEQUENCE = 3;
+
+    public static final String PROFILE_KEY_NAME_ENCRYPT = "profile_key_name_encrypt_";
+    public static final String PROFILE_KEY_NAME_DECRYPT = "profile_key_name_decrypt_";
+
+    private final Context mContext;
+    private final ContentResolver mContentResolver;
+    private DevicePolicyManager mDevicePolicyManager;
+    private ILockSettings mLockSettingsService;
+    private UserManager mUserManager;
+    private final Handler mHandler;
+
+    /**
+     * Use {@link TrustManager#isTrustUsuallyManaged(int)}.
+     *
+     * This returns the lazily-peristed value and should only be used by TrustManagerService.
+     */
+    public boolean isTrustUsuallyManaged(int userId) {
+        if (!(mLockSettingsService instanceof ILockSettings.Stub)) {
+            throw new IllegalStateException("May only be called by TrustManagerService. "
+                    + "Use TrustManager.isTrustUsuallyManaged()");
+        }
+        try {
+            return getLockSettings().getBoolean(IS_TRUST_USUALLY_MANAGED, false, userId);
+        } catch (RemoteException e) {
+            return false;
+        }
+    }
+
+    public void setTrustUsuallyManaged(boolean managed, int userId) {
+        try {
+            getLockSettings().setBoolean(IS_TRUST_USUALLY_MANAGED, managed, userId);
+        } catch (RemoteException e) {
+            // System dead.
+        }
+    }
+
+    public void userPresent(int userId) {
+        try {
+            getLockSettings().userPresent(userId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+    public static final class RequestThrottledException extends Exception {
+        private int mTimeoutMs;
+        public RequestThrottledException(int timeoutMs) {
+            mTimeoutMs = timeoutMs;
+        }
+
+        /**
+         * @return The amount of time in ms before another request may
+         * be executed
+         */
+        public int getTimeoutMs() {
+            return mTimeoutMs;
+        }
+
+    }
+
+    public DevicePolicyManager getDevicePolicyManager() {
+        if (mDevicePolicyManager == null) {
+            mDevicePolicyManager =
+                (DevicePolicyManager)mContext.getSystemService(Context.DEVICE_POLICY_SERVICE);
+            if (mDevicePolicyManager == null) {
+                Log.e(TAG, "Can't get DevicePolicyManagerService: is it running?",
+                        new IllegalStateException("Stack trace:"));
+            }
+        }
+        return mDevicePolicyManager;
+    }
+
+ 

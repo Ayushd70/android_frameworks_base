@@ -202,6 +202,7 @@ public class LockPatternView extends View {
 
             }
         }
+     }
 
         private static void checkRange(int row, int column, byte size) {
             if (row < 0 || row > size - 1) {
